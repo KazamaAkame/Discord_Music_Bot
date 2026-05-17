@@ -113,6 +113,7 @@ In Discord Developer Portal:
 ## Notes
 
 - Spotify API does not provide direct audio streaming here; this bot only uses Spotify metadata and then plays YouTube matches.
+- Spotify single-track links are usually the most reliable Spotify input mode in this bot.
 - Loudness balancing is enabled by default (`dynaudnorm + alimiter`). You can tweak it with `ENABLE_AUDIO_NORMALIZER` and `AUDIO_FILTER_CHAIN` in `.env`.
 - Large queue/playlist limits are configurable in `.env` (`MAX_QUEUE_LENGTH`, `MAX_YOUTUBE_PLAYLIST_TRACKS`, `MAX_SPOTIFY_TRACKS`).
   - Current recommended max for Spotify import is `MAX_SPOTIFY_TRACKS=9999` (very large playlists can take longer to resolve).
