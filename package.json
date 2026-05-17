@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "sync": "powershell -ExecutionPolicy Bypass -File ./sync.ps1"
   },
   "keywords": [],
   "author": "",

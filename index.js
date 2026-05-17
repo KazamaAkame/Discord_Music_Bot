@@ -1083,7 +1083,20 @@ async function resolveTracks(query, { requestedBy, requestedByUserId }) {
     for (const item of spotifyTracks) {
       const artistText = Array.isArray(item.artists) && item.artists.length > 0 ? item.artists.join(', ') : '';
       const fallbackTitle = artistText ? `${artistText} - ${item.name}` : item.name;
-      const yt = await searchYouTubeTrack(`${fallbackTitle} audio`).catch(() => null);
+      const queryCandidates = [
+        `${fallbackTitle} audio`,
+        `${fallbackTitle} official audio`,
+        `${fallbackTitle}`,
+      ];
+
+      let yt = null;
+      for (const candidate of queryCandidates) {
+        yt = await searchYouTubeTrack(candidate).catch(() => null);
+        if (yt) {
+          break;
+        }
+      }
+
       if (!yt) {
         skippedTitles.push(fallbackTitle);
         continue;

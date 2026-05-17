@@ -54,6 +54,26 @@ For Spotify playlists that require user auth:
 npm run start
 ```
 
+## Quick Git Sync (one command)
+
+You can auto-run `git add + commit + push` with:
+
+```powershell
+.\sync.ps1
+```
+
+Optional custom commit message:
+
+```powershell
+.\sync.ps1 -Message "feat: update music bot"
+```
+
+Or use npm shortcut:
+
+```bash
+npm run sync
+```
+
 ## 4. Discord developer setup
 
 In Discord Developer Portal:
