@@ -25,7 +25,10 @@ DISCORD_GUILD_ID=...
 - If `DISCORD_GUILD_ID` is set, slash commands appear quickly in that guild.
 - Without `DISCORD_GUILD_ID`, commands are global and can take up to about 1 hour to appear.
 
-### Optional: Spotify URL support
+### Optional: Spotify URL support (advanced)
+
+Spotify playlist support requires OAuth authorization, callback handling, tester/account access setup, and permission alignment.
+Use it when needed, but for day-to-day playback, YouTube / YouTube Music playlists are usually simpler and more stable.
 
 Add:
 
@@ -42,11 +45,14 @@ Then in Spotify Developer Dashboard:
 - Add the same callback URI in `Redirect URIs`:
   - `http://127.0.0.1:8787/spotify/callback`
 - Save settings.
+- If your app is still in development mode, also add testers in `Users and Access` (otherwise those Spotify accounts will get API 403: "not registered for this application").
 
 For Spotify playlists that require user auth:
 1. Run `/spotifylogin` in Discord.
 2. Click the auth link and approve Spotify access.
-3. After browser success page, use `/play <spotify playlist url>`.
+3. If browser shows `127.0.0.1 ... connection refused`, copy the full URL from the address bar.
+4. Run `/spotifycallback callback_url:<that full URL>` in Discord.
+5. Then use `/play <spotify playlist url>`.
 
 ## 3. Run
 
@@ -97,6 +103,7 @@ In Discord Developer Portal:
 - `/queue`
 - `/clearupcoming` (clear all upcoming tracks, keep now playing)
 - `/spotifylogin` (authorize Spotify playlist access)
+- `/spotifycallback callback_url:<full callback url>` (finish Spotify authorization from any device)
 - `/spotifylogout` (remove your Spotify auth)
 - `/list` (progress bar + upcoming tracks)
 - `/stop`
@@ -108,5 +115,12 @@ In Discord Developer Portal:
 - Spotify API does not provide direct audio streaming here; this bot only uses Spotify metadata and then plays YouTube matches.
 - Loudness balancing is enabled by default (`dynaudnorm + alimiter`). You can tweak it with `ENABLE_AUDIO_NORMALIZER` and `AUDIO_FILTER_CHAIN` in `.env`.
 - Large queue/playlist limits are configurable in `.env` (`MAX_QUEUE_LENGTH`, `MAX_YOUTUBE_PLAYLIST_TRACKS`, `MAX_SPOTIFY_TRACKS`).
+  - Current recommended max for Spotify import is `MAX_SPOTIFY_TRACKS=9999` (very large playlists can take longer to resolve).
+- Spotify large-playlist import tuning:
+  - `SPOTIFY_SEARCH_CONCURRENCY` (default `6`): parallel YouTube matching workers.
+  - `SPOTIFY_PROGRESS_EVERY` (default `25`): update progress every N processed tracks.
+  - `SPOTIFY_PROGRESS_MIN_INTERVAL_MS` (default `2000`): minimum interval between progress message edits.
+- If Spotify returns `403 Forbidden` on playlist items, the authorized account likely lacks access to that playlist (owner/collaborator/private visibility issue).
+- In practice, Spotify playlist integration is more operationally complex than YouTube playlist playback. If your use case does not strictly require Spotify links, using YouTube / YouTube Music is recommended.
 - `/list` shows a compact upcoming preview (default 10 tracks) and also displays total queued count.
 - Use this bot in compliance with Discord, YouTube, and Spotify terms.

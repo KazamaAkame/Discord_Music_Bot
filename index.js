@@ -39,11 +39,17 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 
 const MAX_QUEUE_LENGTH = clamp(toNumber(process.env.MAX_QUEUE_LENGTH, 100), 1, 9999);
-const MAX_SPOTIFY_TRACKS = clamp(toNumber(process.env.MAX_SPOTIFY_TRACKS, 25), 1, 999);
+const MAX_SPOTIFY_TRACKS = clamp(toNumber(process.env.MAX_SPOTIFY_TRACKS, 25), 1, 9999);
 const MAX_YOUTUBE_PLAYLIST_TRACKS = clamp(
   toNumber(process.env.MAX_YOUTUBE_PLAYLIST_TRACKS, 30),
   1,
   9999,
+);
+const SPOTIFY_SEARCH_CONCURRENCY = clamp(toNumber(process.env.SPOTIFY_SEARCH_CONCURRENCY, 6), 1, 20);
+const SPOTIFY_PROGRESS_EVERY = clamp(toNumber(process.env.SPOTIFY_PROGRESS_EVERY, 25), 1, 500);
+const SPOTIFY_PROGRESS_MIN_INTERVAL_MS = Math.max(
+  500,
+  toNumber(process.env.SPOTIFY_PROGRESS_MIN_INTERVAL_MS, 2000),
 );
 const DEFAULT_VOLUME_PERCENT = toNumber(process.env.DEFAULT_VOLUME_PERCENT, 80);
 const STATUS_UPDATE_INTERVAL_MS = toNumber(process.env.STATUS_UPDATE_INTERVAL_MS, 5000);
@@ -143,7 +149,30 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({
           content:
             '\u8acb\u9ede\u64ca\u4ee5\u4e0b\u9023\u7d50\u6388\u6b0a Spotify\uff0c\u5b8c\u6210\u5f8c\u518d\u56de Discord \u4f7f\u7528 /play\uff1a\n' +
+            '\n1) \u4efb\u4f55\u88dd\u7f6e\u90fd\u80fd\u958b\u9019\u500b\u9023\u7d50\u6388\u6b0a\n' +
+            '2) \u6388\u6b0a\u5f8c\u700f\u89bd\u5668\u82e5\u986f\u793a 127.0.0.1 \u7121\u6cd5\u9023\u7dda\u662f\u6b63\u5e38\u7684\n' +
+            '3) \u8acb\u628a\u7576\u4e0b\u5740\u5217\u5b8c\u6574 URL \u8cbc\u5230 /spotifycallback \u7684 callback_url \u53c3\u6578\n\n' +
             authUrl,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (command === 'spotifycallback') {
+        if (!spotifyOAuthManager?.enabled) {
+          await interaction.reply(
+            '\u5c1a\u672a\u555f\u7528 Spotify OAuth\u3002\u8acb\u5148\u8a2d\u5b9a SPOTIFY_CLIENT_ID\u3001SPOTIFY_CLIENT_SECRET\u3001SPOTIFY_REDIRECT_URI\u3002',
+          );
+          return;
+        }
+
+        const callbackUrl = interaction.options.getString('callback_url', true).trim();
+        await spotifyOAuthManager.completeAuthorizationFromCallbackUrl(callbackUrl, {
+          actingDiscordUserId: interaction.user.id,
+        });
+        await interaction.reply({
+          content:
+            '\u2705 Spotify \u6388\u6b0a\u6210\u529f\uff01\u5df2\u7d81\u5b9a\u4f60\u7684 Discord \u5e33\u865f\uff0c\u73fe\u5728\u53ef\u4ee5\u7528 /play \u64ad\u653e Spotify \u6b4c\u55ae\u3002',
           ephemeral: true,
         });
         return;
@@ -457,23 +486,33 @@ async function handlePlayRequest(interaction, session, query, { ephemeral = fals
 
   session.setTextChannel(interaction.channelId);
   await session.connect(voiceChannel);
+  const reportProgress = createInteractionProgressReporter(interaction);
 
   const tracks = await resolveTracks(trimmedQuery, {
     requestedBy: interaction.user.username,
     requestedByUserId: interaction.user.id,
+    onProgress: reportProgress,
   });
   const skippedTitles = Array.isArray(tracks?.skippedTitles) ? tracks.skippedTitles : [];
+  const dedupedTitles = Array.isArray(tracks?.dedupedTitles) ? tracks.dedupedTitles : [];
 
   if (!tracks.length) {
-    if (skippedTitles.length > 0) {
-      const preview = skippedTitles
-        .slice(0, 5)
-        .map((title, index) => `${index + 1}. ${title}`)
-        .join('\n');
-      const more = skippedTitles.length > 5 ? `\n...\u9084\u6709 ${skippedTitles.length - 5} \u9996` : '';
-      await interaction.editReply(
-        `\u9019\u6b21\u6c92\u6709\u627e\u5230\u53ef\u64ad\u653e\u7684 YouTube \u5c0d\u61c9\u4f86\u6e90\u3002\n\u5df2\u8df3\u904e ${skippedTitles.length} \u9996\uff1a\n${preview}${more}`
-      );
+    if (skippedTitles.length > 0 || dedupedTitles.length > 0) {
+      const details = [];
+      if (skippedTitles.length > 0) {
+        const preview = skippedTitles
+          .slice(0, 5)
+          .map((title, index) => `${index + 1}. ${title}`)
+          .join('\n');
+        const more = skippedTitles.length > 5 ? `\n...\u9084\u6709 ${skippedTitles.length - 5} \u9996` : '';
+        details.push(
+          `\u627e\u4e0d\u5230 YouTube \u5c0d\u61c9\u4f86\u6e90 ${skippedTitles.length} \u9996\uff1a\n${preview}${more}`,
+        );
+      }
+      if (dedupedTitles.length > 0) {
+        details.push(`\u5df2\u53bb\u91cd ${dedupedTitles.length} \u9996\uff08\u907f\u514d\u91cd\u8907\u64ad\u653e\u540c\u4e00\u90e8 YouTube \u5f71\u7247\uff09`);
+      }
+      await interaction.editReply(`\u9019\u6b21\u6c92\u6709\u53ef\u52a0\u5165\u4f47\u5217\u7684\u6b4c\u66f2\u3002\n${details.join('\n')}`);
     } else {
       await interaction.editReply('\u627e\u4e0d\u5230\u53ef\u64ad\u653e\u7684\u7d50\u679c\uff0c\u8acb\u63db\u95dc\u9375\u5b57\u6216\u9023\u7d50\u3002');
     }
@@ -500,6 +539,9 @@ async function handlePlayRequest(interaction, session, query, { ephemeral = fals
   const notes = [];
   if (skippedTitles.length > 0) {
     notes.push(`\u8DF3\u904E ${skippedTitles.length} \u9996\u7121\u6CD5\u5C0D\u61C9 YouTube \u7684\u6B4C\u66F2`);
+  }
+  if (dedupedTitles.length > 0) {
+    notes.push(`\u53bb\u91cd ${dedupedTitles.length} \u9996\u91cd\u8907\u7684 YouTube \u7d50\u679c`);
   }
   if (droppedByQueue > 0) {
     notes.push(`\u4F47\u5217\u4E0A\u9650\u672A\u52A0\u5165 ${droppedByQueue} \u9996`);
@@ -550,6 +592,56 @@ async function replyToInteraction(interaction, content, { ephemeral = false } = 
   }
 
   return interaction.reply({ content, ephemeral });
+}
+
+function createInteractionProgressReporter(interaction) {
+  let lastUpdatedAt = 0;
+  let lastText = '';
+
+  return async (progress) => {
+    if (!interaction?.deferred && !interaction?.replied) {
+      return;
+    }
+
+    const text = formatSpotifyImportProgress(progress);
+    if (!text || text === lastText) {
+      return;
+    }
+
+    const now = Date.now();
+    const force = Boolean(progress?.force);
+    if (!force && now - lastUpdatedAt < SPOTIFY_PROGRESS_MIN_INTERVAL_MS) {
+      return;
+    }
+
+    lastUpdatedAt = now;
+    lastText = text;
+    await interaction.editReply(text).catch(() => null);
+  };
+}
+
+function formatSpotifyImportProgress(progress) {
+  const stage = String(progress?.stage || '');
+
+  if (stage === 'spotify_fetch') {
+    return '正在讀取 Spotify 歌單內容...';
+  }
+
+  if (stage === 'spotify_search') {
+    const total = Math.max(0, numberOrZero(progress?.total));
+    const processed = clamp(numberOrZero(progress?.processed), 0, total || 999999);
+    const added = Math.max(0, numberOrZero(progress?.added));
+    const skipped = Math.max(0, numberOrZero(progress?.skipped));
+    const deduped = Math.max(0, numberOrZero(progress?.deduped));
+    const percent = total > 0 ? Math.min(100, Math.floor((processed / total) * 100)) : 0;
+
+    return [
+      `正在轉換 Spotify -> YouTube：${processed}/${total}（${percent}%）`,
+      `已加入 ${added} 首，略過 ${skipped} 首，去重 ${deduped} 首。`,
+    ].join('\n');
+  }
+
+  return '';
 }
 
 async function sendOrRefreshListMessage(
@@ -726,12 +818,18 @@ async function updateListMessage(message, guildId, { keepComponents = true } = {
 function formatUserError(error) {
   const raw = String(error?.message || '').trim();
   if (error?.code === 'ABORT_ERR' || /operation was aborted/i.test(raw)) {
-    return '語音連線失敗，請確認該頻道已給機器人 ViewChannel、Connect、Speak 權限後再試。';
+    return '\u8a9e\u97f3\u9023\u7dda\u5931\u6557\uff0c\u8acb\u78ba\u8a8d\u8a72\u983b\u9053\u5df2\u7d66\u6a5f\u5668\u4eba ViewChannel\u3001Connect\u3001Speak \u6b0a\u9650\u5f8c\u518d\u8a66\u3002';
   }
   if (/spotify api/i.test(raw) && /valid user authentication required/i.test(raw)) {
     return '\u9019\u662f Spotify \u6b0a\u9650\u9650\u5236\uff1a\u76ee\u524d\u6a5f\u5668\u4eba\u4f7f\u7528\u7684\u662f\u300c\u61c9\u7528\u7a0b\u5f0f\u6191\u8b49\u300d\uff0c\u53ef\u4ee5\u8b80\u55ae\u66f2/\u5c08\u8f2f\uff0c\u4f46 Spotify \u6b4c\u55ae\u9700\u8981\u4f7f\u7528\u8005\u6388\u6b0a\u624d\u80fd\u8b80\u53d6\u3002\u8acb\u6539\u7528 YouTube \u6b4c\u55ae\uff0c\u6216\u6211\u53ef\u4ee5\u5e6b\u4f60\u52a0\u4e0a Spotify OAuth \u6388\u6b0a\u6d41\u7a0b\u3002';
   }
-  return raw || '指令執行失敗，請稍後再試。';
+  if (isSpotifyUserNotRegisteredError(error)) {
+    return 'Spotify 開發模式限制：此 Spotify 帳號尚未加入這個 App 的 Users and Access。請到 Spotify Developer Dashboard -> 你的 App -> Users and Access 新增此帳號，再重新 /spotifylogin + /spotifycallback。';
+  }
+  if (isSpotifyForbiddenError(error)) {
+    return 'Spotify \u56de\u50b3 403 Forbidden\uff1a\u76ee\u524d\u6388\u6b0a\u5e33\u865f\u6c92\u6709\u8b80\u53d6\u9019\u4efd\u6b4c\u55ae\u7684\u6b0a\u9650\u3002\u8acb\u6539\u6210\u516c\u958b\u6b4c\u55ae\uff0c\u6216\u4f7f\u7528\u6709\u6b0a\u9650\u7684 Spotify \u5e33\u865f\u91cd\u65b0 /spotifylogin \u5f8c\uff0c\u628a\u56de\u547c URL \u8cbc\u5230 /spotifycallback\u3002';
+  }
+  return raw || '\u6307\u4ee4\u57f7\u884c\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66\u3002';
 }
 
 async function registerCommands() {
@@ -755,6 +853,15 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('spotifylogin')
       .setDescription('\u6388\u6b0a Spotify\uff08\u4f9b Spotify \u6b4c\u55ae\u89e3\u6790\u4f7f\u7528\uff09'),
+    new SlashCommandBuilder()
+      .setName('spotifycallback')
+      .setDescription('\u8cbc\u4e0a Spotify \u56de\u547c URL \u4ee5\u5b8c\u6210\u6388\u6b0a')
+      .addStringOption((option) =>
+        option
+          .setName('callback_url')
+          .setDescription('Spotify \u6388\u6b0a\u5f8c\u700f\u89bd\u5668\u5740\u5217\u7684\u5b8c\u6574 URL')
+          .setRequired(true),
+      ),
     new SlashCommandBuilder()
       .setName('spotifylogout')
       .setDescription('\u79fb\u9664\u4f60\u7684 Spotify \u6388\u6b0a'),
@@ -1038,7 +1145,7 @@ class GuildMusicSession {
   }
 }
 
-async function resolveTracks(query, { requestedBy, requestedByUserId }) {
+async function resolveTracks(query, { requestedBy, requestedByUserId, onProgress = null }) {
   const trimmed = query.trim();
 
   if (!trimmed) {
@@ -1046,8 +1153,8 @@ async function resolveTracks(query, { requestedBy, requestedByUserId }) {
   }
 
   const normalizedInput = normalizeYouTubeInputUrl(trimmed);
-
-  const spotifyType = parseSpotifyType(normalizedInput);
+  const normalizedSpotifyInput = await normalizeSpotifyInputUrl(normalizedInput);
+  const spotifyType = parseSpotifyType(normalizedSpotifyInput);
   if (spotifyType) {
     if (!spotifyResolver.enabled) {
       throw new Error(
@@ -1055,61 +1162,21 @@ async function resolveTracks(query, { requestedBy, requestedByUserId }) {
       );
     }
 
-    let spotifyTracks;
-    try {
-      spotifyTracks = await spotifyResolver.resolve(normalizedInput, MAX_SPOTIFY_TRACKS);
-    } catch (error) {
-      if (
-        spotifyType === 'playlist' &&
-        isSpotifyUserAuthRequiredError(error) &&
-        spotifyOAuthManager?.enabled
-      ) {
-        const userAccessToken = await spotifyOAuthManager.getUserAccessToken(requestedByUserId);
-        if (!userAccessToken) {
-          throw new Error(
-            '\u9019\u500b Spotify \u6b4c\u55ae\u9700\u8981\u4f7f\u7528\u8005\u6388\u6b0a\u3002\u8acb\u5148\u57f7\u884c /spotifylogin \u5b8c\u6210\u6388\u6b0a\u5f8c\u518d\u8a66\u4e00\u6b21\u3002',
-          );
-        }
-        spotifyTracks = await spotifyResolver.resolve(normalizedInput, MAX_SPOTIFY_TRACKS, {
-          accessTokenOverride: userAccessToken,
-        });
-      } else {
-        throw error;
-      }
-    }
-    const resolved = [];
-    const skippedTitles = [];
+    await onProgress?.({
+      stage: 'spotify_fetch',
+      force: true,
+    });
 
-    for (const item of spotifyTracks) {
-      const artistText = Array.isArray(item.artists) && item.artists.length > 0 ? item.artists.join(', ') : '';
-      const fallbackTitle = artistText ? `${artistText} - ${item.name}` : item.name;
-      const queryCandidates = [
-        `${fallbackTitle} audio`,
-        `${fallbackTitle} official audio`,
-        `${fallbackTitle}`,
-      ];
+    const spotifyTracks = await resolveSpotifySourceTracksWithAuthFallback({
+      inputUrl: normalizedSpotifyInput,
+      spotifyType,
+      requestedByUserId,
+    });
 
-      let yt = null;
-      for (const candidate of queryCandidates) {
-        yt = await searchYouTubeTrack(candidate).catch(() => null);
-        if (yt) {
-          break;
-        }
-      }
-
-      if (!yt) {
-        skippedTitles.push(fallbackTitle);
-        continue;
-      }
-      resolved.push({
-        ...yt,
-        requestedBy,
-        source: 'spotify->youtube',
-      });
-    }
-
-    resolved.skippedTitles = skippedTitles;
-    return resolved;
+    return resolveSpotifyTracksToYoutube(spotifyTracks, {
+      requestedBy,
+      onProgress,
+    });
   }
 
   const ytType = play.yt_validate(normalizedInput);
@@ -1230,6 +1297,193 @@ async function searchYouTubeTrack(input) {
   } catch {
     return null;
   }
+}
+
+async function resolveSpotifySourceTracksWithAuthFallback({ inputUrl, spotifyType, requestedByUserId }) {
+  try {
+    return await spotifyResolver.resolve(inputUrl, MAX_SPOTIFY_TRACKS);
+  } catch (baseError) {
+    const canUseUserToken =
+      spotifyType === 'playlist' &&
+      spotifyOAuthManager?.enabled &&
+      isSpotifyUserTokenFallbackError(baseError);
+    if (!canUseUserToken) {
+      throw baseError;
+    }
+
+    const tokenCandidates = [];
+    const seenTokens = new Set();
+    const requestedUserToken = await spotifyOAuthManager.getUserAccessToken(requestedByUserId);
+    if (requestedUserToken) {
+      tokenCandidates.push({ label: 'requester', userId: String(requestedByUserId), token: requestedUserToken });
+      seenTokens.add(requestedUserToken);
+    }
+
+    const otherUserTokens = await spotifyOAuthManager.getAllUserAccessTokens({
+      excludeUserIds: [requestedByUserId],
+    });
+    for (const row of otherUserTokens) {
+      if (!row?.token || seenTokens.has(row.token)) {
+        continue;
+      }
+      seenTokens.add(row.token);
+      tokenCandidates.push({ label: 'shared', userId: row.userId, token: row.token });
+    }
+
+    if (!tokenCandidates.length) {
+      throw new Error(
+        '這個 Spotify 歌單需要使用者授權。請先執行 /spotifylogin，授權後若瀏覽器停在 127.0.0.1，請把完整網址貼到 /spotifycallback 完成綁定。',
+      );
+    }
+
+    let lastTokenError = baseError;
+    const tokenErrors = [];
+    for (const candidate of tokenCandidates) {
+      try {
+        return await spotifyResolver.resolve(inputUrl, MAX_SPOTIFY_TRACKS, {
+          accessTokenOverride: candidate.token,
+        });
+      } catch (tokenError) {
+        lastTokenError = tokenError;
+        tokenErrors.push(tokenError);
+      }
+    }
+
+    if (tokenErrors.some((error) => isSpotifyUserNotRegisteredError(error))) {
+      throw new Error(
+        'Spotify 開發模式限制：其中一個授權帳號尚未加入此 App 的 Users and Access。請到 Spotify Developer Dashboard -> 你的 App -> Users and Access 加入該帳號，然後重新 /spotifylogin + /spotifycallback。',
+      );
+    }
+
+    if (isSpotifyForbiddenError(lastTokenError)) {
+      throw new Error(
+        `Spotify 回傳 403 Forbidden：已嘗試 ${tokenCandidates.length} 個授權帳號，皆無法讀取此歌單。請改成公開歌單，或用有權限的帳號執行 /spotifylogin + /spotifycallback 後再試。`,
+      );
+    }
+
+    throw lastTokenError;
+  }
+}
+
+async function resolveSpotifyTracksToYoutube(spotifyTracks, { requestedBy, onProgress = null }) {
+  const total = Math.max(0, spotifyTracks.length);
+  const resolved = [];
+  const skippedTitles = [];
+  const dedupedTitles = [];
+
+  if (!total) {
+    resolved.skippedTitles = skippedTitles;
+    resolved.dedupedTitles = dedupedTitles;
+    return resolved;
+  }
+
+  let processed = 0;
+  let added = 0;
+  let skipped = 0;
+  let deduped = 0;
+  let nextIndex = 0;
+  const workerCount = Math.min(SPOTIFY_SEARCH_CONCURRENCY, total);
+  const candidateResults = new Array(total);
+
+  const maybeReport = async (force = false) => {
+    if (!onProgress) {
+      return;
+    }
+    if (!force && processed % SPOTIFY_PROGRESS_EVERY !== 0) {
+      return;
+    }
+
+    await onProgress({
+      stage: 'spotify_search',
+      total,
+      processed,
+      added,
+      skipped,
+      deduped,
+      force,
+    });
+  };
+
+  await maybeReport(true);
+
+  const workers = Array.from({ length: workerCount }, () =>
+    (async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= total) {
+          break;
+        }
+
+        const item = spotifyTracks[index];
+        const fallbackTitle = buildSpotifyFallbackTitle(item);
+        const queryCandidates = [
+          `${fallbackTitle} audio`,
+          `${fallbackTitle} official audio`,
+          `${fallbackTitle}`,
+        ];
+
+        let yt = null;
+        for (const candidate of queryCandidates) {
+          yt = await searchYouTubeTrack(candidate).catch(() => null);
+          if (yt) {
+            break;
+          }
+        }
+        candidateResults[index] = {
+          fallbackTitle,
+          yt,
+        };
+
+        processed += 1;
+        await maybeReport(processed >= total);
+      }
+    })(),
+  );
+
+  await Promise.all(workers);
+
+  const seenResolvedKeys = new Set();
+  for (const candidate of candidateResults) {
+    if (!candidate?.yt) {
+      skipped += 1;
+      if (candidate?.fallbackTitle) {
+        skippedTitles.push(candidate.fallbackTitle);
+      }
+      continue;
+    }
+
+    const dedupKey = createTrackDedupKey(candidate.yt);
+    if (dedupKey && seenResolvedKeys.has(dedupKey)) {
+      deduped += 1;
+      if (candidate.fallbackTitle) {
+        dedupedTitles.push(candidate.fallbackTitle);
+      }
+      continue;
+    }
+
+    if (dedupKey) {
+      seenResolvedKeys.add(dedupKey);
+    }
+
+    added += 1;
+    resolved.push({
+      ...candidate.yt,
+      requestedBy,
+      source: 'spotify->youtube',
+    });
+  }
+
+  await maybeReport(true);
+
+  resolved.skippedTitles = skippedTitles;
+  resolved.dedupedTitles = dedupedTitles;
+  return resolved;
+}
+
+function buildSpotifyFallbackTitle(item) {
+  const artistText = Array.isArray(item?.artists) && item.artists.length > 0 ? item.artists.join(', ') : '';
+  return artistText ? `${artistText} - ${item.name}` : item.name;
 }
 
 async function createPlaybackResource(track) {
@@ -1397,6 +1651,129 @@ function normalizeYouTubeInputUrl(input) {
   return url.toString();
 }
 
+function createTrackDedupKey(track) {
+  const rawUrl = typeof track?.url === 'string' ? track.url.trim() : '';
+  if (!rawUrl) {
+    return '';
+  }
+
+  const normalizedUrl = normalizeYouTubeInputUrl(rawUrl);
+  try {
+    const url = new URL(normalizedUrl);
+    const host = url.hostname.toLowerCase();
+
+    if (host === 'youtu.be' || host === 'www.youtu.be') {
+      const shortId = url.pathname.split('/').filter(Boolean)[0];
+      if (shortId) {
+        return `yt:${shortId}`;
+      }
+    }
+
+    if (new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']).has(host)) {
+      const watchId = url.searchParams.get('v');
+      if (watchId) {
+        return `yt:${watchId}`;
+      }
+
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2 && new Set(['shorts', 'live', 'embed']).has(parts[0])) {
+        return `yt:${parts[1]}`;
+      }
+    }
+  } catch {}
+
+  return `url:${normalizedUrl}`;
+}
+
+async function normalizeSpotifyInputUrl(input) {
+  const raw = String(input || '').trim();
+  if (!raw) {
+    return raw;
+  }
+
+  const parsed = parseSpotifyResource(raw);
+  if (parsed) {
+    return toCanonicalSpotifyInput(parsed);
+  }
+
+  const candidateUrl = extractFirstHttpUrl(raw);
+  const expanded = await resolveSpotifyShortUrl(candidateUrl);
+  if (!expanded) {
+    return raw;
+  }
+
+  const parsedExpanded = parseSpotifyResource(expanded);
+  if (!parsedExpanded) {
+    return raw;
+  }
+
+  return toCanonicalSpotifyInput(parsedExpanded);
+}
+
+function toCanonicalSpotifyInput(parsed) {
+  // Keep URI form for backward compatibility with parse flow and logs.
+  if (parsed.raw.startsWith('spotify:')) {
+    return parsed.raw;
+  }
+  return `https://open.spotify.com/${parsed.kind}/${parsed.id}`;
+}
+
+async function resolveSpotifyShortUrl(candidateUrl) {
+  if (!candidateUrl) {
+    return null;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(candidateUrl);
+  } catch {
+    return null;
+  }
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    return null;
+  }
+
+  const shortHosts = new Set(['spotify.link', 'www.spotify.link', 'spoti.fi', 'www.spoti.fi']);
+  if (!shortHosts.has(parsedUrl.hostname.toLowerCase())) {
+    return null;
+  }
+
+  try {
+    const res = await fetch(parsedUrl.toString(), {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (res?.url && parseSpotifyResource(res.url)) {
+      return res.url;
+    }
+  } catch {}
+
+  try {
+    const oembedUrl = new URL('https://open.spotify.com/oembed');
+    oembedUrl.searchParams.set('url', parsedUrl.toString());
+
+    const res = await fetch(oembedUrl, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      return null;
+    }
+
+    const data = await res.json();
+    const html = typeof data?.html === 'string' ? data.html : '';
+    const embedMatch = html.match(/https:\/\/open\.spotify\.com\/embed\/(track|album|playlist)\/([A-Za-z0-9]{8,})/i);
+    if (!embedMatch) {
+      return null;
+    }
+    return `https://open.spotify.com/${embedMatch[1].toLowerCase()}/${embedMatch[2]}`;
+  } catch {
+    return null;
+  }
+}
+
 function isYouTubeLikeUrl(input) {
   let url;
   try {
@@ -1500,17 +1877,123 @@ async function resolveYouTubeUrlWithYtDlp(input, { requestedBy, maxTracks }) {
 }
 
 function parseSpotifyType(input) {
-  const url = input.trim();
-  const match = url.match(/(?:open\.spotify\.com\/(track|album|playlist)\/|spotify:(track|album|playlist):)([A-Za-z0-9]+)/i);
-  if (!match) {
+  const parsed = parseSpotifyResource(input);
+  return parsed?.kind || null;
+}
+
+function parseSpotifyResource(input) {
+  const rawInput = String(input || '').trim();
+  if (!rawInput) {
     return null;
   }
-  return (match[1] || match[2] || '').toLowerCase() || null;
+
+  const unwrapped = rawInput.replace(/^<(.+)>$/, '$1').trim();
+
+  const uriMatch = unwrapped.match(/spotify:(track|album|playlist):([A-Za-z0-9]{8,})/i);
+  if (uriMatch) {
+    return {
+      kind: uriMatch[1].toLowerCase(),
+      id: uriMatch[2],
+      raw: unwrapped,
+    };
+  }
+
+  const candidateUrl = extractFirstHttpUrl(unwrapped);
+  if (!candidateUrl) {
+    return null;
+  }
+
+  let url;
+  try {
+    url = new URL(candidateUrl);
+  } catch {
+    return null;
+  }
+
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    return null;
+  }
+
+  const host = url.hostname.toLowerCase();
+  if (!new Set(['open.spotify.com', 'play.spotify.com']).has(host)) {
+    return null;
+  }
+
+  const pathParts = url.pathname.split('/').filter(Boolean);
+  if (!pathParts.length) {
+    return null;
+  }
+
+  // Spotify localized links often include /intl-xx/ prefix.
+  if (/^intl-[a-z]{2}(?:-[a-z]{2})?$/i.test(pathParts[0])) {
+    pathParts.shift();
+  }
+
+  if (pathParts[0] === 'embed') {
+    pathParts.shift();
+  }
+
+  if (!pathParts.length) {
+    return null;
+  }
+
+  const directKind = pathParts[0]?.toLowerCase();
+  const directId = pathParts[1];
+  if (new Set(['track', 'album', 'playlist']).has(directKind) && /^[A-Za-z0-9]{8,}$/.test(directId || '')) {
+    return {
+      kind: directKind,
+      id: directId,
+      raw: unwrapped,
+    };
+  }
+
+  const legacyUserPlaylistMatch = pathParts.join('/').match(
+    /^user\/[^/]+\/playlist\/([A-Za-z0-9]{8,})$/i,
+  );
+  if (legacyUserPlaylistMatch) {
+    return {
+      kind: 'playlist',
+      id: legacyUserPlaylistMatch[1],
+      raw: unwrapped,
+    };
+  }
+
+  return null;
+}
+
+function extractFirstHttpUrl(text) {
+  const match = String(text).match(/https?:\/\/[^\s)>\]}]+/i);
+  return match ? match[0] : null;
 }
 
 function isSpotifyUserAuthRequiredError(error) {
   const text = String(error?.message || '');
   return /spotify api/i.test(text) && /valid user authentication required/i.test(text);
+}
+
+function parseSpotifyApiStatusCode(error) {
+  const text = String(error?.message || '');
+  const match =
+    text.match(/spotify api.*?[（(]\s*(\d{3})\s*[)）]/i) ||
+    text.match(/spotify api[\s\S]*?\b(\d{3})\b/i);
+  if (!match) {
+    return 0;
+  }
+  return numberOrZero(match[1]);
+}
+
+function isSpotifyForbiddenError(error) {
+  const text = String(error?.message || '');
+  return parseSpotifyApiStatusCode(error) === 403 || (/spotify api/i.test(text) && /forbidden/i.test(text));
+}
+
+function isSpotifyUserNotRegisteredError(error) {
+  const text = String(error?.message || '');
+  return /not registered for this application/i.test(text);
+}
+
+function isSpotifyUserTokenFallbackError(error) {
+  return isSpotifyUserAuthRequiredError(error) || isSpotifyForbiddenError(error);
 }
 
 class SpotifyUserTokenStore {
@@ -1546,6 +2029,15 @@ class SpotifyUserTokenStore {
 
   get(discordUserId) {
     return this.data.users[String(discordUserId)] || null;
+  }
+
+  getFirstUserId() {
+    const keys = Object.keys(this.data.users || {});
+    return keys.length > 0 ? keys[0] : null;
+  }
+
+  getAllUserIds() {
+    return Object.keys(this.data.users || {});
   }
 
   set(discordUserId, payload) {
@@ -1604,6 +2096,55 @@ class SpotifyOAuthManager {
     return this.tokenStore.clear(discordUserId);
   }
 
+  async completeAuthorizationFromCallbackUrl(callbackUrl, { actingDiscordUserId = null } = {}) {
+    if (!this.enabled) {
+      throw new Error('Spotify OAuth is not configured.');
+    }
+
+    const rawInput = String(callbackUrl || '').trim();
+    if (!rawInput) {
+      throw new Error('\u8acb\u63d0\u4f9b\u5b8c\u6574\u7684 callback URL\u3002');
+    }
+
+    const candidate = extractFirstHttpUrl(rawInput) || rawInput.replace(/^<(.+)>$/, '$1').trim();
+    let incoming;
+    try {
+      incoming = new URL(candidate);
+    } catch {
+      throw new Error('\u7121\u6cd5\u89e3\u6790 callback URL\uff0c\u8acb\u78ba\u8a8d\u4f60\u8cbc\u7684\u662f\u700f\u89bd\u5668\u5740\u5217\u5b8c\u6574\u9023\u7d50\u3002');
+    }
+
+    const expected = new URL(this.redirectUri);
+    if (incoming.pathname !== expected.pathname) {
+      throw new Error('\u9019\u4e0d\u662f\u6b64\u6a5f\u5668\u4eba\u7684 Spotify callback \u8def\u5f91\uff0c\u8acb\u91cd\u65b0\u57f7\u884c /spotifylogin \u5f8c\u518d\u8a66\u3002');
+    }
+
+    const error = incoming.searchParams.get('error');
+    if (error) {
+      throw new Error(`Spotify \u6388\u6b0a\u5931\u6557\uff1a${error}`);
+    }
+
+    const code = incoming.searchParams.get('code');
+    const state = incoming.searchParams.get('state');
+    const pending = this.consumePendingState(state);
+    if (!code || !pending) {
+      throw new Error('\u6388\u6b0a\u9023\u7d50\u5df2\u904e\u671f\u6216 state \u4e0d\u7b26\uff0c\u8acb\u91cd\u65b0\u57f7\u884c /spotifylogin\u3002');
+    }
+
+    if (actingDiscordUserId && String(actingDiscordUserId) !== String(pending.discordUserId)) {
+      throw new Error('\u9019\u500b\u6388\u6b0a\u9023\u7d50\u662f\u7d66\u5176\u4ed6 Discord \u5e33\u865f\u7684\uff0c\u8acb\u7528\u540c\u4e00\u500b\u5e33\u865f\u91cd\u65b0 /spotifylogin\u3002');
+    }
+
+    const token = await this.requestToken({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: this.redirectUri,
+    });
+
+    this.saveUserToken(pending.discordUserId, token);
+    return pending.discordUserId;
+  }
+
   async getUserAccessToken(discordUserId) {
     const record = this.tokenStore.get(discordUserId);
     if (!record) {
@@ -1624,18 +2165,52 @@ class SpotifyOAuthManager {
         grant_type: 'refresh_token',
         refresh_token: record.refreshToken,
       });
-      this.tokenStore.set(discordUserId, {
-        accessToken: refreshed.access_token,
-        refreshToken: refreshed.refresh_token || record.refreshToken,
-        expiresAt: Date.now() + Math.max((refreshed.expires_in || 3600) - 30, 60) * 1000,
-        scope: refreshed.scope || record.scope || this.scopes,
-        updatedAt: new Date().toISOString(),
+      this.saveUserToken(discordUserId, refreshed, {
+        fallbackRefreshToken: record.refreshToken,
+        fallbackScope: record.scope || this.scopes,
       });
       return refreshed.access_token;
     } catch (error) {
       console.warn('Failed to refresh Spotify user token:', error?.message || error);
       return null;
     }
+  }
+
+  async getAnyUserAccessToken() {
+    const userId = this.tokenStore.getFirstUserId();
+    if (!userId) {
+      return null;
+    }
+    return this.getUserAccessToken(userId);
+  }
+
+  async getAllUserAccessTokens({ excludeUserIds = [] } = {}) {
+    const excluded = new Set((excludeUserIds || []).map((x) => String(x)));
+    const userIds = this.tokenStore.getAllUserIds();
+    const results = [];
+
+    for (const userId of userIds) {
+      if (excluded.has(String(userId))) {
+        continue;
+      }
+      const token = await this.getUserAccessToken(userId);
+      if (!token) {
+        continue;
+      }
+      results.push({ userId: String(userId), token });
+    }
+
+    return results;
+  }
+
+  saveUserToken(discordUserId, token, { fallbackRefreshToken = null, fallbackScope = null } = {}) {
+    this.tokenStore.set(discordUserId, {
+      accessToken: token.access_token,
+      refreshToken: token.refresh_token || fallbackRefreshToken || null,
+      expiresAt: Date.now() + Math.max((token.expires_in || 3600) - 30, 60) * 1000,
+      scope: token.scope || fallbackScope || this.scopes,
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   async startCallbackServer() {
@@ -1690,13 +2265,7 @@ class SpotifyOAuthManager {
           redirect_uri: this.redirectUri,
         });
 
-        this.tokenStore.set(pending.discordUserId, {
-          accessToken: token.access_token,
-          refreshToken: token.refresh_token || null,
-          expiresAt: Date.now() + Math.max((token.expires_in || 3600) - 30, 60) * 1000,
-          scope: token.scope || this.scopes,
-          updatedAt: new Date().toISOString(),
-        });
+        this.saveUserToken(pending.discordUserId, token);
 
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(
@@ -1793,15 +2362,11 @@ class SpotifyMetadataResolver {
   }
 
   parseSpotifyUrl(raw) {
-    const match = raw.match(/(?:open\.spotify\.com\/(track|album|playlist)\/|spotify:(track|album|playlist):)([A-Za-z0-9]+)/i);
-    if (!match) {
+    const parsed = parseSpotifyResource(raw);
+    if (!parsed) {
       return null;
     }
-
-    return {
-      kind: (match[1] || match[2]).toLowerCase(),
-      id: match[3],
-    };
+    return { kind: parsed.kind, id: parsed.id };
   }
 
   async fetchTrack(id, accessTokenOverride = null) {
@@ -1861,8 +2426,16 @@ class SpotifyMetadataResolver {
 
       const items = data.items || [];
       for (const row of items) {
-        const item = row.track;
-        if (!item || item.type !== 'track') {
+        // Spotify Web API may return track rows as `row.track` (legacy)
+        // or as `row.item` on newer playlist items responses.
+        const item = row?.track || row?.item;
+        if (!item) {
+          continue;
+        }
+
+        const itemType = String(item.type || '').toLowerCase();
+        const isTrackLike = itemType === 'track' || item.track === true;
+        if (!isTrackLike) {
           continue;
         }
 
