@@ -3,3 +3,4 @@
 *.log
 runtime*.log
 bot*.log
+spotify-user-tokens.json

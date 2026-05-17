@@ -1,5 +1,10 @@
 require('dotenv').config();
 
+const crypto = require('crypto');
+const fs = require('fs');
+const http = require('http');
+const path = require('path');
+
 const {
   AudioPlayerStatus,
   NoSubscriberBehavior,
@@ -48,6 +53,12 @@ const ENABLE_AUDIO_NORMALIZER = toBoolean(process.env.ENABLE_AUDIO_NORMALIZER, t
 const AUDIO_FILTER_CHAIN =
   process.env.AUDIO_FILTER_CHAIN ||
   'dynaudnorm=f=250:g=13:m=15:s=10,alimiter=limit=0.95';
+const SPOTIFY_REDIRECT_URI =
+  process.env.SPOTIFY_REDIRECT_URI || 'http://127.0.0.1:8787/spotify/callback';
+const SPOTIFY_OAUTH_SCOPES =
+  process.env.SPOTIFY_OAUTH_SCOPES || 'playlist-read-private playlist-read-collaborative';
+const SPOTIFY_USER_TOKEN_FILE =
+  process.env.SPOTIFY_USER_TOKEN_FILE || path.join(__dirname, 'spotify-user-tokens.json');
 
 if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in .env');
@@ -59,6 +70,7 @@ const client = new Client({
 });
 
 let spotifyResolver;
+let spotifyOAuthManager;
 
 const UI_IDS = {
   panelPlay: 'music:panel:play',
@@ -89,6 +101,13 @@ function getSession(guildId) {
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
+    if (spotifyOAuthManager?.enabled) {
+      try {
+        await spotifyOAuthManager.startCallbackServer();
+      } catch (error) {
+        console.error('Spotify OAuth callback server failed to start:', error);
+      }
+    }
     await registerCommands();
   } catch (error) {
     console.error('Failed to register commands:', error);
@@ -109,6 +128,34 @@ client.on('interactionCreate', async (interaction) => {
       if (command === 'play') {
         const query = interaction.options.getString('query', true).trim();
         await handlePlayRequest(interaction, session, query);
+        return;
+      }
+
+      if (command === 'spotifylogin') {
+        if (!spotifyOAuthManager?.enabled) {
+          await interaction.reply(
+            '\u5c1a\u672a\u555f\u7528 Spotify OAuth\u3002\u8acb\u5148\u8a2d\u5b9a SPOTIFY_CLIENT_ID\u3001SPOTIFY_CLIENT_SECRET\u3001SPOTIFY_REDIRECT_URI\u3002',
+          );
+          return;
+        }
+
+        const authUrl = spotifyOAuthManager.createAuthorizationUrl(interaction.user.id);
+        await interaction.reply({
+          content:
+            '\u8acb\u9ede\u64ca\u4ee5\u4e0b\u9023\u7d50\u6388\u6b0a Spotify\uff0c\u5b8c\u6210\u5f8c\u518d\u56de Discord \u4f7f\u7528 /play\uff1a\n' +
+            authUrl,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (command === 'spotifylogout') {
+        const removed = spotifyOAuthManager?.clearUserToken(interaction.user.id) ?? false;
+        await interaction.reply(
+          removed
+            ? '\u5df2\u79fb\u9664\u4f60\u7684 Spotify \u6388\u6b0a\u8cc7\u6599\u3002'
+            : '\u76ee\u524d\u6c92\u6709\u4f60\u7684 Spotify \u6388\u6b0a\u8cc7\u6599\u3002',
+        );
         return;
       }
 
@@ -413,17 +460,34 @@ async function handlePlayRequest(interaction, session, query, { ephemeral = fals
 
   const tracks = await resolveTracks(trimmedQuery, {
     requestedBy: interaction.user.username,
+    requestedByUserId: interaction.user.id,
   });
+  const skippedTitles = Array.isArray(tracks?.skippedTitles) ? tracks.skippedTitles : [];
 
   if (!tracks.length) {
-    await interaction.editReply('找不到可播放的結果，請換關鍵字或連結。');
+    if (skippedTitles.length > 0) {
+      const preview = skippedTitles
+        .slice(0, 5)
+        .map((title, index) => `${index + 1}. ${title}`)
+        .join('\n');
+      const more = skippedTitles.length > 5 ? `\n...\u9084\u6709 ${skippedTitles.length - 5} \u9996` : '';
+      await interaction.editReply(
+        `\u9019\u6b21\u6c92\u6709\u627e\u5230\u53ef\u64ad\u653e\u7684 YouTube \u5c0d\u61c9\u4f86\u6e90\u3002\n\u5df2\u8df3\u904e ${skippedTitles.length} \u9996\uff1a\n${preview}${more}`
+      );
+    } else {
+      await interaction.editReply('\u627e\u4e0d\u5230\u53ef\u64ad\u653e\u7684\u7d50\u679c\uff0c\u8acb\u63db\u95dc\u9375\u5b57\u6216\u9023\u7d50\u3002');
+    }
     return;
   }
 
   const availableSlots = MAX_QUEUE_LENGTH - session.queue.length;
   const tracksToAdd = tracks.slice(0, Math.max(availableSlots, 0));
   if (!tracksToAdd.length) {
-    await interaction.editReply(`佇列已滿（${MAX_QUEUE_LENGTH} 首）。`);
+    const skipNote =
+      skippedTitles.length > 0
+        ? `\n\u53e6\u5916\u5df2\u8df3\u904e ${skippedTitles.length} \u9996\u7121\u6cd5\u5c0d\u61c9 YouTube \u7684\u6b4c\u66f2\u3002`
+        : '';
+    await interaction.editReply(`\u4f47\u5217\u5df2\u6eff\uff08${MAX_QUEUE_LENGTH} \u9996\uff09\u3002${skipNote}`);
     return;
   }
 
@@ -431,10 +495,31 @@ async function handlePlayRequest(interaction, session, query, { ephemeral = fals
   await session.playIfIdle();
 
   const first = tracksToAdd[0];
-  const suffix = tracksToAdd.length > 1 ? `，另外加入 ${tracksToAdd.length - 1} 首` : '';
-  await interaction.editReply(
-    `已加入佇列：**${first.title}**（${formatDuration(first.durationSec)}）${suffix}`,
-  );
+  const suffix = tracksToAdd.length > 1 ? `\uFF0C\u53E6\u5916\u52A0\u5165 ${tracksToAdd.length - 1} \u9996` : '';
+  const droppedByQueue = Math.max(0, tracks.length - tracksToAdd.length);
+  const notes = [];
+  if (skippedTitles.length > 0) {
+    notes.push(`\u8DF3\u904E ${skippedTitles.length} \u9996\u7121\u6CD5\u5C0D\u61C9 YouTube \u7684\u6B4C\u66F2`);
+  }
+  if (droppedByQueue > 0) {
+    notes.push(`\u4F47\u5217\u4E0A\u9650\u672A\u52A0\u5165 ${droppedByQueue} \u9996`);
+  }
+
+  let message = `\u5DF2\u52A0\u5165\u4F47\u5217\uFF1A**${first.title}**\uFF08${formatDuration(first.durationSec)}\uFF09${suffix}`;
+  if (notes.length > 0) {
+    message += `\n${notes.join('\n')}`;
+  }
+  if (skippedTitles.length > 0) {
+    const preview = skippedTitles
+      .slice(0, 3)
+      .map((title, index) => `${index + 1}. ${title}`)
+      .join('\n');
+    if (preview) {
+      message += `\n\u8DF3\u904E\u7BC4\u4F8B\uFF1A\n${preview}`;
+    }
+  }
+
+  await interaction.editReply(message.slice(0, 1900));
 }
 
 async function getMissingVoicePermissions(guild, voiceChannel) {
@@ -643,6 +728,9 @@ function formatUserError(error) {
   if (error?.code === 'ABORT_ERR' || /operation was aborted/i.test(raw)) {
     return '語音連線失敗，請確認該頻道已給機器人 ViewChannel、Connect、Speak 權限後再試。';
   }
+  if (/spotify api/i.test(raw) && /valid user authentication required/i.test(raw)) {
+    return '\u9019\u662f Spotify \u6b0a\u9650\u9650\u5236\uff1a\u76ee\u524d\u6a5f\u5668\u4eba\u4f7f\u7528\u7684\u662f\u300c\u61c9\u7528\u7a0b\u5f0f\u6191\u8b49\u300d\uff0c\u53ef\u4ee5\u8b80\u55ae\u66f2/\u5c08\u8f2f\uff0c\u4f46 Spotify \u6b4c\u55ae\u9700\u8981\u4f7f\u7528\u8005\u6388\u6b0a\u624d\u80fd\u8b80\u53d6\u3002\u8acb\u6539\u7528 YouTube \u6b4c\u55ae\uff0c\u6216\u6211\u53ef\u4ee5\u5e6b\u4f60\u52a0\u4e0a Spotify OAuth \u6388\u6b0a\u6d41\u7a0b\u3002';
+  }
   return raw || '指令執行失敗，請稍後再試。';
 }
 
@@ -664,6 +752,12 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('clearupcoming')
       .setDescription('\u6e05\u9664\u6240\u6709\u5f85\u64ad\u6b4c\u66f2\uff08\u4e0d\u5f71\u97ff\u76ee\u524d\u64ad\u653e\uff09'),
+    new SlashCommandBuilder()
+      .setName('spotifylogin')
+      .setDescription('\u6388\u6b0a Spotify\uff08\u4f9b Spotify \u6b4c\u55ae\u89e3\u6790\u4f7f\u7528\uff09'),
+    new SlashCommandBuilder()
+      .setName('spotifylogout')
+      .setDescription('\u79fb\u9664\u4f60\u7684 Spotify \u6388\u6b0a'),
     new SlashCommandBuilder().setName('list').setDescription('顯示播放進度條與接下來歌曲清單'),
     new SlashCommandBuilder().setName('stop').setDescription('停止播放並清空佇列'),
     new SlashCommandBuilder().setName('leave').setDescription('讓機器人離開語音頻道'),
@@ -944,7 +1038,7 @@ class GuildMusicSession {
   }
 }
 
-async function resolveTracks(query, { requestedBy }) {
+async function resolveTracks(query, { requestedBy, requestedByUserId }) {
   const trimmed = query.trim();
 
   if (!trimmed) {
@@ -961,12 +1055,37 @@ async function resolveTracks(query, { requestedBy }) {
       );
     }
 
-    const spotifyTracks = await spotifyResolver.resolve(normalizedInput, MAX_SPOTIFY_TRACKS);
+    let spotifyTracks;
+    try {
+      spotifyTracks = await spotifyResolver.resolve(normalizedInput, MAX_SPOTIFY_TRACKS);
+    } catch (error) {
+      if (
+        spotifyType === 'playlist' &&
+        isSpotifyUserAuthRequiredError(error) &&
+        spotifyOAuthManager?.enabled
+      ) {
+        const userAccessToken = await spotifyOAuthManager.getUserAccessToken(requestedByUserId);
+        if (!userAccessToken) {
+          throw new Error(
+            '\u9019\u500b Spotify \u6b4c\u55ae\u9700\u8981\u4f7f\u7528\u8005\u6388\u6b0a\u3002\u8acb\u5148\u57f7\u884c /spotifylogin \u5b8c\u6210\u6388\u6b0a\u5f8c\u518d\u8a66\u4e00\u6b21\u3002',
+          );
+        }
+        spotifyTracks = await spotifyResolver.resolve(normalizedInput, MAX_SPOTIFY_TRACKS, {
+          accessTokenOverride: userAccessToken,
+        });
+      } else {
+        throw error;
+      }
+    }
     const resolved = [];
+    const skippedTitles = [];
 
     for (const item of spotifyTracks) {
-      const yt = await searchYouTubeTrack(`${item.artists.join(', ')} - ${item.name} audio`);
+      const artistText = Array.isArray(item.artists) && item.artists.length > 0 ? item.artists.join(', ') : '';
+      const fallbackTitle = artistText ? `${artistText} - ${item.name}` : item.name;
+      const yt = await searchYouTubeTrack(`${fallbackTitle} audio`).catch(() => null);
       if (!yt) {
+        skippedTitles.push(fallbackTitle);
         continue;
       }
       resolved.push({
@@ -976,10 +1095,7 @@ async function resolveTracks(query, { requestedBy }) {
       });
     }
 
-    if (!resolved.length) {
-      throw new Error('Spotify 曲目已解析，但找不到可播放的 YouTube 對應來源。');
-    }
-
+    resolved.skippedTitles = skippedTitles;
     return resolved;
   }
 
@@ -1047,23 +1163,60 @@ async function resolveTracks(query, { requestedBy }) {
 }
 
 async function searchYouTubeTrack(input) {
-  const results = await play.search(input, {
-    limit: 1,
-    source: {
-      youtube: 'video',
-    },
-  });
+  try {
+    const results = await play.search(input, {
+      limit: 1,
+      source: {
+        youtube: 'video',
+      },
+    });
 
-  const first = results?.[0];
-  if (!first) {
-    return null;
+    const first = results?.[0];
+    if (first) {
+      return {
+        title: first.title,
+        url: first.url,
+        durationSec: numberOrZero(first.durationInSec),
+      };
+    }
+  } catch (error) {
+    console.warn('play-dl search failed, fallback to yt-dlp:', error?.message || error);
   }
 
-  return {
-    title: first.title,
-    url: first.url,
-    durationSec: numberOrZero(first.durationInSec),
-  };
+  try {
+    const info = await ytdlp(`ytsearch1:${input}`, {
+      dumpSingleJson: true,
+      skipDownload: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      noCallHome: true,
+      preferFreeFormats: true,
+      youtubeSkipDashManifest: true,
+    });
+
+    const entry =
+      Array.isArray(info?.entries) && info.entries.length > 0
+        ? info.entries[0]
+        : info && typeof info === 'object'
+          ? info
+          : null;
+    if (!entry) {
+      return null;
+    }
+
+    const url = entry.webpage_url || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : null);
+    if (!url) {
+      return null;
+    }
+
+    return {
+      title: entry.title || input,
+      url: normalizeYouTubeInputUrl(url),
+      durationSec: numberOrZero(entry.duration),
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function createPlaybackResource(track) {
@@ -1342,6 +1495,255 @@ function parseSpotifyType(input) {
   return (match[1] || match[2] || '').toLowerCase() || null;
 }
 
+function isSpotifyUserAuthRequiredError(error) {
+  const text = String(error?.message || '');
+  return /spotify api/i.test(text) && /valid user authentication required/i.test(text);
+}
+
+class SpotifyUserTokenStore {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.data = { users: {} };
+    this.load();
+  }
+
+  load() {
+    try {
+      if (!fs.existsSync(this.filePath)) {
+        return;
+      }
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      this.data = {
+        users: typeof parsed?.users === 'object' && parsed.users ? parsed.users : {},
+      };
+    } catch (error) {
+      console.warn('Failed to load Spotify user token store:', error?.message || error);
+      this.data = { users: {} };
+    }
+  }
+
+  save() {
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
+  }
+
+  get(discordUserId) {
+    return this.data.users[String(discordUserId)] || null;
+  }
+
+  set(discordUserId, payload) {
+    this.data.users[String(discordUserId)] = payload;
+    this.save();
+  }
+
+  clear(discordUserId) {
+    const key = String(discordUserId);
+    const exists = Boolean(this.data.users[key]);
+    if (exists) {
+      delete this.data.users[key];
+      this.save();
+    }
+    return exists;
+  }
+}
+
+class SpotifyOAuthManager {
+  constructor({ clientId, clientSecret, redirectUri, scopes, tokenStore }) {
+    this.clientId = clientId;
+    this.clientSecret = clientSecret;
+    this.redirectUri = redirectUri;
+    this.scopes = scopes;
+    this.tokenStore = tokenStore;
+    this.pendingStates = new Map();
+    this.server = null;
+  }
+
+  get enabled() {
+    return Boolean(this.clientId && this.clientSecret && this.redirectUri);
+  }
+
+  createAuthorizationUrl(discordUserId) {
+    if (!this.enabled) {
+      throw new Error('Spotify OAuth is not configured.');
+    }
+
+    const state = crypto.randomBytes(24).toString('hex');
+    this.pendingStates.set(state, {
+      discordUserId: String(discordUserId),
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+
+    const url = new URL('https://accounts.spotify.com/authorize');
+    url.searchParams.set('client_id', this.clientId);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('redirect_uri', this.redirectUri);
+    url.searchParams.set('scope', this.scopes);
+    url.searchParams.set('state', state);
+    url.searchParams.set('show_dialog', 'true');
+    return url.toString();
+  }
+
+  clearUserToken(discordUserId) {
+    return this.tokenStore.clear(discordUserId);
+  }
+
+  async getUserAccessToken(discordUserId) {
+    const record = this.tokenStore.get(discordUserId);
+    if (!record) {
+      return null;
+    }
+
+    const now = Date.now();
+    if (record.accessToken && now < Number(record.expiresAt || 0) - 60_000) {
+      return record.accessToken;
+    }
+
+    if (!record.refreshToken) {
+      return null;
+    }
+
+    try {
+      const refreshed = await this.requestToken({
+        grant_type: 'refresh_token',
+        refresh_token: record.refreshToken,
+      });
+      this.tokenStore.set(discordUserId, {
+        accessToken: refreshed.access_token,
+        refreshToken: refreshed.refresh_token || record.refreshToken,
+        expiresAt: Date.now() + Math.max((refreshed.expires_in || 3600) - 30, 60) * 1000,
+        scope: refreshed.scope || record.scope || this.scopes,
+        updatedAt: new Date().toISOString(),
+      });
+      return refreshed.access_token;
+    } catch (error) {
+      console.warn('Failed to refresh Spotify user token:', error?.message || error);
+      return null;
+    }
+  }
+
+  async startCallbackServer() {
+    if (!this.enabled || this.server) {
+      return;
+    }
+
+    const redirectUrl = new URL(this.redirectUri);
+    if (redirectUrl.protocol !== 'http:') {
+      console.warn('Spotify OAuth callback server only supports http redirect URI.');
+      return;
+    }
+
+    const host = redirectUrl.hostname || '127.0.0.1';
+    const port = Number(redirectUrl.port || 80);
+    const callbackPath = redirectUrl.pathname || '/';
+
+    this.server = http.createServer(async (req, res) => {
+      try {
+        if (!req.url) {
+          res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Bad request');
+          return;
+        }
+
+        const incoming = new URL(req.url, `${redirectUrl.protocol}//${req.headers.host}`);
+        if (incoming.pathname !== callbackPath) {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Not found');
+          return;
+        }
+
+        const error = incoming.searchParams.get('error');
+        if (error) {
+          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end('<h2>Spotify authorization failed.</h2><p>You can close this page.</p>');
+          return;
+        }
+
+        const code = incoming.searchParams.get('code');
+        const state = incoming.searchParams.get('state');
+        const pending = this.consumePendingState(state);
+        if (!code || !pending) {
+          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end('<h2>Invalid authorization state.</h2><p>Please retry /spotifylogin.</p>');
+          return;
+        }
+
+        const token = await this.requestToken({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: this.redirectUri,
+        });
+
+        this.tokenStore.set(pending.discordUserId, {
+          accessToken: token.access_token,
+          refreshToken: token.refresh_token || null,
+          expiresAt: Date.now() + Math.max((token.expires_in || 3600) - 30, 60) * 1000,
+          scope: token.scope || this.scopes,
+          updatedAt: new Date().toISOString(),
+        });
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(
+          '<h2>Spotify authorization success.</h2><p>Return to Discord and use /play with a Spotify playlist URL.</p>',
+        );
+      } catch (serverError) {
+        console.error('Spotify OAuth callback error:', serverError);
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<h2>Internal error.</h2><p>Please retry /spotifylogin.</p>');
+      }
+    });
+
+    await new Promise((resolve, reject) => {
+      this.server.once('error', reject);
+      this.server.listen(port, host, () => {
+        this.server.removeListener('error', reject);
+        resolve();
+      });
+    });
+
+    console.log(`Spotify OAuth callback server listening at ${this.redirectUri}`);
+  }
+
+  consumePendingState(state) {
+    if (!state) {
+      return null;
+    }
+    const pending = this.pendingStates.get(state);
+    this.pendingStates.delete(state);
+    if (!pending) {
+      return null;
+    }
+    if (Date.now() > pending.expiresAt) {
+      return null;
+    }
+    return pending;
+  }
+
+  async requestToken(formPayload) {
+    const auth = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString('base64');
+    const body = new URLSearchParams(formPayload);
+
+    const res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: body.toString(),
+    });
+
+    if (!res.ok) {
+      const text = await safeText(res);
+      throw new Error(`Spotify OAuth token failed (${res.status}): ${text}`);
+    }
+
+    return res.json();
+  }
+}
+
 class SpotifyMetadataResolver {
   constructor({ clientId, clientSecret, market }) {
     this.clientId = clientId;
@@ -1355,23 +1757,23 @@ class SpotifyMetadataResolver {
     return Boolean(this.clientId && this.clientSecret);
   }
 
-  async resolve(url, limit) {
+  async resolve(url, limit, { accessTokenOverride = null } = {}) {
     const parsed = this.parseSpotifyUrl(url);
     if (!parsed) {
       throw new Error('Spotify 連結格式不正確。');
     }
 
     if (parsed.kind === 'track') {
-      const track = await this.fetchTrack(parsed.id);
+      const track = await this.fetchTrack(parsed.id, accessTokenOverride);
       return [track];
     }
 
     if (parsed.kind === 'album') {
-      return this.fetchAlbumTracks(parsed.id, limit);
+      return this.fetchAlbumTracks(parsed.id, limit, accessTokenOverride);
     }
 
     if (parsed.kind === 'playlist') {
-      return this.fetchPlaylistTracks(parsed.id, limit);
+      return this.fetchPlaylistTracks(parsed.id, limit, accessTokenOverride);
     }
 
     return [];
@@ -1389,23 +1791,27 @@ class SpotifyMetadataResolver {
     };
   }
 
-  async fetchTrack(id) {
-    const data = await this.api(`/tracks/${id}`);
+  async fetchTrack(id, accessTokenOverride = null) {
+    const data = await this.api(`/tracks/${id}`, {}, accessTokenOverride);
     return {
       name: data.name,
       artists: (data.artists || []).map((x) => x.name).filter(Boolean),
     };
   }
 
-  async fetchAlbumTracks(id, limit) {
+  async fetchAlbumTracks(id, limit, accessTokenOverride = null) {
     const tracks = [];
     let offset = 0;
 
     while (tracks.length < limit) {
-      const data = await this.api(`/albums/${id}/tracks`, {
-        limit: Math.min(50, limit - tracks.length),
-        offset,
-      });
+      const data = await this.api(
+        `/albums/${id}/tracks`,
+        {
+          limit: Math.min(50, limit - tracks.length),
+          offset,
+        },
+        accessTokenOverride,
+      );
 
       const items = data.items || [];
       for (const item of items) {
@@ -1424,17 +1830,21 @@ class SpotifyMetadataResolver {
     return tracks;
   }
 
-  async fetchPlaylistTracks(id, limit) {
+  async fetchPlaylistTracks(id, limit, accessTokenOverride = null) {
     const tracks = [];
     let offset = 0;
 
     while (tracks.length < limit) {
-      const data = await this.api(`/playlists/${id}/items`, {
-        market: this.market,
-        additional_types: 'track',
-        limit: Math.min(50, limit - tracks.length),
-        offset,
-      });
+      const data = await this.api(
+        `/playlists/${id}/items`,
+        {
+          market: this.market,
+          additional_types: 'track',
+          limit: Math.min(50, limit - tracks.length),
+          offset,
+        },
+        accessTokenOverride,
+      );
 
       const items = data.items || [];
       for (const row of items) {
@@ -1458,12 +1868,12 @@ class SpotifyMetadataResolver {
     return tracks;
   }
 
-  async api(path, query = {}) {
+  async api(path, query = {}, accessTokenOverride = null) {
     if (!this.enabled) {
       throw new Error('尚未設定 Spotify 憑證。');
     }
 
-    const token = await this.getAccessToken();
+    const token = accessTokenOverride || (await this.getAccessToken());
     const url = new URL(`https://api.spotify.com/v1${path}`);
 
     for (const [key, value] of Object.entries(query)) {
@@ -1516,6 +1926,14 @@ spotifyResolver = new SpotifyMetadataResolver({
   clientId: process.env.SPOTIFY_CLIENT_ID,
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
   market: process.env.SPOTIFY_MARKET || 'US',
+});
+
+spotifyOAuthManager = new SpotifyOAuthManager({
+  clientId: process.env.SPOTIFY_CLIENT_ID,
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+  redirectUri: SPOTIFY_REDIRECT_URI,
+  scopes: SPOTIFY_OAUTH_SCOPES,
+  tokenStore: new SpotifyUserTokenStore(SPOTIFY_USER_TOKEN_FILE),
 });
 
 async function safeText(res) {

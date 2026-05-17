@@ -33,7 +33,20 @@ Add:
 SPOTIFY_CLIENT_ID=...
 SPOTIFY_CLIENT_SECRET=...
 SPOTIFY_MARKET=US
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8787/spotify/callback
+SPOTIFY_OAUTH_SCOPES=playlist-read-private playlist-read-collaborative
 ```
+
+Then in Spotify Developer Dashboard:
+- Open your app -> `Edit settings`
+- Add the same callback URI in `Redirect URIs`:
+  - `http://127.0.0.1:8787/spotify/callback`
+- Save settings.
+
+For Spotify playlists that require user auth:
+1. Run `/spotifylogin` in Discord.
+2. Click the auth link and approve Spotify access.
+3. After browser success page, use `/play <spotify playlist url>`.
 
 ## 3. Run
 
@@ -62,6 +75,9 @@ In Discord Developer Portal:
 - `/pause`
 - `/resume`
 - `/queue`
+- `/clearupcoming` (clear all upcoming tracks, keep now playing)
+- `/spotifylogin` (authorize Spotify playlist access)
+- `/spotifylogout` (remove your Spotify auth)
 - `/list` (progress bar + upcoming tracks)
 - `/stop`
 - `/leave`
