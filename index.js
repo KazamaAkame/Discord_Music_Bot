@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -13,6 +14,7 @@ const {
   createAudioPlayer,
   createAudioResource,
   entersState,
+  generateDependencyReport,
   joinVoiceChannel,
 } = require('@discordjs/voice');
 const {
@@ -134,6 +136,15 @@ client.on('interactionCreate', async (interaction) => {
       if (command === 'play') {
         const query = interaction.options.getString('query', true).trim();
         await handlePlayRequest(interaction, session, query);
+        return;
+      }
+
+      if (command === 'diag') {
+        const text = buildRuntimeDiagnosticsText();
+        await interaction.reply({
+          content: text,
+          ephemeral: true,
+        });
         return;
       }
 
@@ -832,6 +843,159 @@ function formatUserError(error) {
   return raw || '\u6307\u4ee4\u57f7\u884c\u5931\u6557\uff0c\u8acb\u7a0d\u5f8c\u518d\u8a66\u3002';
 }
 
+
+function buildRuntimeDiagnosticsText() {
+  const lines = ['\u7cfb\u7d71\u8a3a\u65b7\uff08\u50c5\u4f60\u53ef\u898b\uff09'];
+
+  const ffmpegProbe = probeFfmpeg();
+  if (ffmpegProbe.ok) {
+    lines.push(`FFmpeg\uff1aOK (${ffmpegProbe.command})`);
+    if (ffmpegProbe.version) {
+      lines.push(`FFmpeg \u7248\u672c\uff1a${ffmpegProbe.version}`);
+    }
+  } else {
+    lines.push(`FFmpeg\uff1a\u5931\u6557\uff08${ffmpegProbe.error}\uff09`);
+    lines.push('\u5efa\u8b70\uff1aLinux \u5148\u57f7\u884c `apt install -y ffmpeg`');
+  }
+
+  const ytdlpProbe = probeYtDlp();
+  if (ytdlpProbe.ok) {
+    lines.push(`yt-dlp\uff1aOK (${ytdlpProbe.command})`);
+    if (ytdlpProbe.version) {
+      lines.push(`yt-dlp \u7248\u672c\uff1a${ytdlpProbe.version}`);
+    }
+  } else {
+    lines.push(`yt-dlp\uff1a\u5931\u6557\uff08${ytdlpProbe.error}\uff09`);
+    lines.push('\u5efa\u8b70\uff1aLinux \u5148\u57f7\u884c `apt install -y yt-dlp`');
+  }
+
+  const depSummary = summarizeDependencyReport(generateDependencyReport());
+  for (const item of depSummary) {
+    lines.push(item);
+  }
+
+  return lines.join('\n').slice(0, 1900);
+}
+
+function probeFfmpeg() {
+  try {
+    const info = prism.FFmpeg.getInfo(true);
+    return {
+      ok: true,
+      command: info.command,
+      version: String(info.version || '').trim(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: compactErrorText(error),
+    };
+  }
+}
+
+function probeYtDlp() {
+  const candidates = [];
+  if (process.env.YTDLP_BINARY) {
+    candidates.push(process.env.YTDLP_BINARY.trim());
+  }
+  if (ytdlp?.constants?.YOUTUBE_DL_PATH) {
+    candidates.push(String(ytdlp.constants.YOUTUBE_DL_PATH).trim());
+  }
+  candidates.push('yt-dlp');
+  candidates.push('youtube-dl');
+
+  const uniq = Array.from(new Set(candidates.filter(Boolean)));
+  const errors = [];
+
+  for (const candidate of uniq) {
+    const result = spawnSync(candidate, ['--version'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      shell: false,
+    });
+
+    if (!result.error && result.status === 0) {
+      return {
+        ok: true,
+        command: candidate,
+        version: String(result.stdout || '').trim().split(/\r?\n/)[0] || '',
+      };
+    }
+
+    const detail = result.error
+      ? compactErrorText(result.error)
+      : `exit=${typeof result.status === 'number' ? result.status : 'unknown'}`;
+    errors.push(`${candidate}: ${detail}`);
+  }
+
+  return {
+    ok: false,
+    error: errors[0] || 'unknown',
+  };
+}
+
+function summarizeDependencyReport(report) {
+  const lines = String(report || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const summary = [];
+  const pick = (prefix, label) => {
+    const hit = lines.find((line) => line.startsWith(prefix));
+    if (hit) {
+      summary.push(`${label}${hit.replace(/^-+\s*/, '')}`);
+    }
+  };
+
+  pick('- @discordjs/opus:', 'Opus \u539f\u751f\uff1a');
+  pick('- opusscript:', 'Opus \u7d14 JS\uff1a');
+  pick('- native crypto support for aes-256-gcm:', 'AES-GCM\uff1a');
+  pick('- libopus:', 'FFmpeg libopus\uff1a');
+
+  return summary;
+}
+
+function compactErrorText(error) {
+  const raw =
+    (error && typeof error === 'object'
+      ? error.stderr || error.stdout || error.message || String(error)
+      : String(error || 'unknown')) || 'unknown';
+  return raw.replace(/\s+/g, ' ').trim().slice(0, 180);
+}
+
+function formatPlaybackErrorReason(error) {
+  const raw = compactErrorText(error).toLowerCase();
+
+  if (raw.includes('ffmpeg/avconv not found') || (raw.includes('ffmpeg') && raw.includes('enoent'))) {
+    return '\u627e\u4e0d\u5230 FFmpeg\uff0c\u8acb\u5148\u5b89\u88dd\uff08Linux\uff1a`apt install -y ffmpeg`\uff09\u3002';
+  }
+  if (
+    (raw.includes('yt-dlp') || raw.includes('youtube-dl')) &&
+    (raw.includes('enoent') || raw.includes('permission denied') || raw.includes('not found'))
+  ) {
+    return 'yt-dlp \u7121\u6cd5\u57f7\u884c\uff0c\u8acb\u5b89\u88dd\u6216\u4fee\u6b63\u57f7\u884c\u6b0a\u9650\uff08Linux\uff1a`apt install -y yt-dlp`\uff09\u3002';
+  }
+  if (
+    raw.includes('opusscript') ||
+    raw.includes('@discordjs/opus') ||
+    raw.includes('cannot play audio') ||
+    raw.includes('encoder')
+  ) {
+    return 'Opus \u7de8\u78bc\u5668\u4e0d\u53ef\u7528\uff0c\u8acb\u5728\u5c08\u6848\u76ee\u9304\u91cd\u65b0\u57f7\u884c `npm install`\u3002';
+  }
+  if (raw.includes('403 forbidden') || raw.includes('http error 403')) {
+    return '\u5f71\u7247\u4f86\u6e90\u62d2\u7d55\u4e32\u6d41\uff08403\uff09\uff0c\u8acb\u6539\u64ad\u53e6\u4e00\u500b\u7248\u672c\u3002';
+  }
+  if (raw.includes('video unavailable')) {
+    return '\u5f71\u7247\u76ee\u524d\u4e0d\u53ef\u7528\uff0c\u8acb\u63db\u4e00\u9996\u3002';
+  }
+  if (raw.includes('certificate') || raw.includes('ssl') || raw.includes('tls')) {
+    return 'TLS/\u6191\u8b49\u9023\u7dda\u5931\u6557\uff0c\u8acb\u78ba\u8a8d\u4e3b\u6a5f\u53ef\u6b63\u5e38\u9023\u5916\u4e26\u5df2\u5b89\u88dd\u6191\u8b49\u3002';
+  }
+  return compactErrorText(error);
+}
+
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
@@ -843,6 +1007,9 @@ async function registerCommands() {
           .setDescription('歌名或連結')
           .setRequired(true),
       ),
+    new SlashCommandBuilder()
+      .setName('diag')
+      .setDescription('\u6aa2\u67e5 ffmpeg / yt-dlp / \u8a9e\u97f3\u4f9d\u8cf4\u662f\u5426\u6b63\u5e38'),
     new SlashCommandBuilder().setName('skip').setDescription('跳過目前歌曲'),
     new SlashCommandBuilder().setName('pause').setDescription('暫停播放'),
     new SlashCommandBuilder().setName('resume').setDescription('繼續播放'),
@@ -1095,7 +1262,8 @@ class GuildMusicSession {
           await this.sendNowPlaying(next);
         } catch (error) {
           console.error('Track stream failed:', next.url, error);
-          await this.sendText(`播放失敗，已跳過：${next.title}`);
+          const reason = formatPlaybackErrorReason(error);
+          await this.sendText(`\u64ad\u653e\u5931\u6557\uff0c\u5df2\u8df3\u904e\uff1a${next.title}\n\u539f\u56e0\uff1a${reason}`);
           this.currentTrack = null;
         }
       }

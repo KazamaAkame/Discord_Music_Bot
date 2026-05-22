@@ -97,6 +97,7 @@ In Discord Developer Portal:
 ## 5. Commands
 
 - `/play query:<song name or URL>`
+- `/diag` (runtime diagnostics for ffmpeg / yt-dlp / voice deps)
 - `/skip`
 - `/pause`
 - `/resume`
@@ -125,3 +126,15 @@ In Discord Developer Portal:
 - In practice, Spotify playlist integration is more operationally complex than YouTube playlist playback. If your use case does not strictly require Spotify links, using YouTube / YouTube Music is recommended.
 - `/list` shows a compact upcoming preview (default 10 tracks) and also displays total queued count.
 - Use this bot in compliance with Discord, YouTube, and Spotify terms.
+
+### Linux playback quick-fix
+
+If the bot can queue songs but immediately says "failed to play, skipped", run:
+
+```bash
+apt update
+apt install -y ffmpeg yt-dlp ca-certificates
+npm install
+```
+
+Then run `/diag` in Discord and confirm `FFmpeg: OK` and `yt-dlp: OK`.
