@@ -138,3 +138,25 @@ npm install
 ```
 
 Then run `/diag` in Discord and confirm `FFmpeg: OK` and `yt-dlp: OK`.
+
+### Cloud VPS YouTube anti-bot fix
+
+If you see `Sign in to confirm you're not a bot`, this is a YouTube anti-bot check on data-center IPs (Azure/AWS/etc), not a Discord permission issue.
+
+1. Export cookies from your local logged-in browser:
+
+```bash
+yt-dlp --cookies-from-browser chrome --cookies cookies.txt "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+2. Upload `cookies.txt` to your bot server project folder.
+
+3. Set in `.env`:
+
+```env
+YTDLP_COOKIES_FILE=cookies.txt
+```
+
+4. Restart the bot and run `/diag`.
+
+When configured correctly, `/diag` will show `YouTube Cookies: 已套用 (...)`.

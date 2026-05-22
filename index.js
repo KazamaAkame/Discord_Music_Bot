@@ -67,6 +67,7 @@ const SPOTIFY_OAUTH_SCOPES =
   process.env.SPOTIFY_OAUTH_SCOPES || 'playlist-read-private playlist-read-collaborative';
 const SPOTIFY_USER_TOKEN_FILE =
   process.env.SPOTIFY_USER_TOKEN_FILE || path.join(__dirname, 'spotify-user-tokens.json');
+const YTDLP_COOKIES_FILE = String(process.env.YTDLP_COOKIES_FILE || '').trim();
 
 if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID) {
   console.error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in .env');
@@ -869,6 +870,8 @@ function buildRuntimeDiagnosticsText() {
     lines.push('\u5efa\u8b70\uff1aLinux \u5148\u57f7\u884c `apt install -y yt-dlp`');
   }
 
+  lines.push(`YouTube Cookies\uff1a${getYtDlpCookiesStatus()}`);
+
   const depSummary = summarizeDependencyReport(generateDependencyReport());
   for (const item of depSummary) {
     lines.push(item);
@@ -891,6 +894,37 @@ function probeFfmpeg() {
       error: compactErrorText(error),
     };
   }
+}
+
+function resolveYtDlpCookiesFilePath() {
+  if (!YTDLP_COOKIES_FILE) {
+    return '';
+  }
+  return path.isAbsolute(YTDLP_COOKIES_FILE)
+    ? YTDLP_COOKIES_FILE
+    : path.join(__dirname, YTDLP_COOKIES_FILE);
+}
+
+function getYtDlpRuntimeOptions(options = {}) {
+  const cookieFile = resolveYtDlpCookiesFilePath();
+  if (!cookieFile) {
+    return options;
+  }
+  return {
+    ...options,
+    cookies: cookieFile,
+  };
+}
+
+function getYtDlpCookiesStatus() {
+  const cookieFile = resolveYtDlpCookiesFilePath();
+  if (!cookieFile) {
+    return '\u672a\u8a2d\u5b9a\uff08YTDLP_COOKIES_FILE\uff09';
+  }
+  if (fs.existsSync(cookieFile)) {
+    return `\u5df2\u5957\u7528\uff08${cookieFile}\uff09`;
+  }
+  return `\u627e\u4e0d\u5230\u6a94\u6848\uff08${cookieFile}\uff09`;
 }
 
 function probeYtDlp() {
@@ -983,6 +1017,9 @@ function formatPlaybackErrorReason(error) {
     raw.includes('encoder')
   ) {
     return 'Opus \u7de8\u78bc\u5668\u4e0d\u53ef\u7528\uff0c\u8acb\u5728\u5c08\u6848\u76ee\u9304\u91cd\u65b0\u57f7\u884c `npm install`\u3002';
+  }
+  if (raw.includes("sign in to confirm you're not a bot") || raw.includes('--cookies-from-browser')) {
+    return 'YouTube \u89f8\u767c\u4eba\u6a5f\u9a57\u8b49\uff0c\u8acb\u8a2d\u5b9a YTDLP_COOKIES_FILE \u4e26\u653e\u5165\u6709\u6548 cookies.txt \u5f8c\u518d\u8a66\u3002';
   }
   if (raw.includes('403 forbidden') || raw.includes('http error 403')) {
     return '\u5f71\u7247\u4f86\u6e90\u62d2\u7d55\u4e32\u6d41\uff08403\uff09\uff0c\u8acb\u6539\u64ad\u53e6\u4e00\u500b\u7248\u672c\u3002';
@@ -1432,7 +1469,7 @@ async function searchYouTubeTrack(input) {
   }
 
   try {
-    const info = await ytdlp(`ytsearch1:${input}`, {
+    const info = await ytdlp(`ytsearch1:${input}`, getYtDlpRuntimeOptions({
       dumpSingleJson: true,
       skipDownload: true,
       noWarnings: true,
@@ -1440,7 +1477,7 @@ async function searchYouTubeTrack(input) {
       noCallHome: true,
       preferFreeFormats: true,
       youtubeSkipDashManifest: true,
-    });
+    }));
 
     const entry =
       Array.isArray(info?.entries) && info.entries.length > 0
@@ -1721,7 +1758,7 @@ async function resolvePlayableAudioUrl(track) {
 }
 
 async function extractAudioUrl(videoUrl) {
-  const info = await ytdlp(videoUrl, {
+  const info = await ytdlp(videoUrl, getYtDlpRuntimeOptions({
     dumpSingleJson: true,
     noWarnings: true,
     noCallHome: true,
@@ -1730,7 +1767,7 @@ async function extractAudioUrl(videoUrl) {
     preferFreeFormats: true,
     youtubeSkipDashManifest: true,
     format: 'bestaudio/best',
-  });
+  }));
 
   if (typeof info?.url === 'string' && info.url.startsWith('http')) {
     return info.url;
@@ -1967,7 +2004,7 @@ function isYouTubeLikeUrl(input) {
 
 async function resolveYouTubeUrlWithYtDlp(input, { requestedBy, maxTracks }) {
   const limit = clamp(numberOrZero(maxTracks) || MAX_YOUTUBE_PLAYLIST_TRACKS, 1, 9999);
-  const info = await ytdlp(input, {
+  const info = await ytdlp(input, getYtDlpRuntimeOptions({
     dumpSingleJson: true,
     skipDownload: true,
     noWarnings: true,
@@ -1978,7 +2015,7 @@ async function resolveYouTubeUrlWithYtDlp(input, { requestedBy, maxTracks }) {
     flatPlaylist: true,
     extractorRetries: 2,
     retries: 2,
-  });
+  }));
 
   const mapEntryToTrack = (entry) => {
     if (!entry || typeof entry !== 'object') {
